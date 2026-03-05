@@ -852,6 +852,105 @@ WHERE EXISTS (
     await this.addTriggerIfNotExists('podcasts', 'title', 'id', 'libraryItems', 'title', 'mediaId')
     await this.addTriggerIfNotExists('podcasts', 'titleIgnorePrefix', 'id', 'libraryItems', 'titleIgnorePrefix', 'mediaId')
     await this.addAuthorNamesTriggersIfNotExist()
+    await this.addFts5BookTriggers()
+  }
+
+  /**
+   * Ensure the fts_books FTS5 virtual table, its backfill, and its three content-sync
+   * triggers exist.  Called on every boot because migrations are skipped when the DB
+   * version already matches the current server version.
+   */
+  async addFts5BookTriggers() {
+    const cols = 'title, titleIgnorePrefix, subtitle, description, publisher, authorNames, narrators, genres, tags'
+
+    // Standalone FTS5 table (no content= option) because `books` has no authorNames column —
+    // authors are stored in `authors` joined via `bookAuthors`.
+    const [[tableRow]] = await this.sequelize.query(
+      "SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type='table' AND name='fts_books'"
+    )
+    const tableExists = tableRow.cnt > 0
+
+    if (!tableExists) {
+      Logger.info('[Database] fts_books table not found — creating FTS5 virtual table and backfilling')
+      await this.sequelize.query(`
+        CREATE VIRTUAL TABLE fts_books USING fts5(
+          ${cols},
+          tokenize='unicode61 remove_diacritics 2'
+        )
+      `)
+      await this.sequelize.query(`
+        INSERT INTO fts_books(rowid, ${cols})
+        SELECT
+          b.rowid,
+          b.title,
+          b.titleIgnorePrefix,
+          b.subtitle,
+          b.description,
+          b.publisher,
+          (SELECT GROUP_CONCAT(a.name, ', ')
+           FROM authors a
+           JOIN bookAuthors ba ON ba.authorId = a.id
+           WHERE ba.bookId = b.id),
+          b.narrators,
+          b.genres,
+          b.tags
+        FROM books b
+      `)
+      Logger.info('[Database] fts_books FTS5 table created and backfilled')
+    }
+
+    if (tableExists) {
+      const [[triggerRow]] = await this.sequelize.query(
+        "SELECT COUNT(*) AS cnt FROM sqlite_master WHERE type='trigger' AND name='fts_books_ai'"
+      )
+      if (triggerRow.cnt > 0) {
+        return // table and triggers both exist — nothing to do
+      }
+    }
+
+    await this.sequelize.query('DROP TRIGGER IF EXISTS fts_books_ai')
+    await this.sequelize.query('DROP TRIGGER IF EXISTS fts_books_ad')
+    await this.sequelize.query('DROP TRIGGER IF EXISTS fts_books_au')
+
+    // authorNames subquery: `books` has no authorNames column; JOIN into authors/bookAuthors.
+    // rowid: FTS5 requires an integer rowid. SQLite tables always have an implicit integer
+    // rowid even when the declared PK is a UUID — so we use old.rowid / new.rowid here and
+    // `books.rowid` in search queries (not books.id which is a UUID string).
+    // Using BEFORE DELETE (not AFTER) so bookAuthors rows still exist when the trigger fires.
+    const authorNamesNew =
+      '(SELECT GROUP_CONCAT(a.name, \', \') FROM authors a JOIN bookAuthors ba ON ba.authorId = a.id WHERE ba.bookId = new.id)'
+    const authorNamesOld =
+      '(SELECT GROUP_CONCAT(a.name, \', \') FROM authors a JOIN bookAuthors ba ON ba.authorId = a.id WHERE ba.bookId = old.id)'
+
+    await this.sequelize.query(`
+      CREATE TRIGGER fts_books_ai AFTER INSERT ON books BEGIN
+        INSERT INTO fts_books(rowid, ${cols})
+        VALUES (new.rowid, new.title, new.titleIgnorePrefix, new.subtitle,
+                new.description, new.publisher, ${authorNamesNew}, new.narrators,
+                new.genres, new.tags);
+      END;
+    `)
+    await this.sequelize.query(`
+      CREATE TRIGGER fts_books_ad BEFORE DELETE ON books BEGIN
+        INSERT INTO fts_books(fts_books, rowid, ${cols})
+        VALUES ('delete', old.rowid, old.title, old.titleIgnorePrefix, old.subtitle,
+                old.description, old.publisher, ${authorNamesOld}, old.narrators,
+                old.genres, old.tags);
+      END;
+    `)
+    await this.sequelize.query(`
+      CREATE TRIGGER fts_books_au AFTER UPDATE ON books BEGIN
+        INSERT INTO fts_books(fts_books, rowid, ${cols})
+        VALUES ('delete', old.rowid, old.title, old.titleIgnorePrefix, old.subtitle,
+                old.description, old.publisher, ${authorNamesOld}, old.narrators,
+                old.genres, old.tags);
+        INSERT INTO fts_books(rowid, ${cols})
+        VALUES (new.rowid, new.title, new.titleIgnorePrefix, new.subtitle,
+                new.description, new.publisher, ${authorNamesNew}, new.narrators,
+                new.genres, new.tags);
+      END;
+    `)
+    Logger.info('[Database] Created FTS5 book sync triggers')
   }
 
   async addTriggerIfNotExists(sourceTable, sourceColumn, sourceIdColumn, targetTable, targetColumn, targetIdColumn) {

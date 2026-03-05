@@ -1050,16 +1050,15 @@ module.exports = {
 
     const textSearchQuery = await Database.createTextSearchQuery(query)
 
-    const matchTitle = textSearchQuery.matchExpression('book.title')
-    const matchSubtitle = textSearchQuery.matchExpression('book.subtitle')
+    // Sanitize query for FTS5: escape double-quotes, wrap in quotes for phrase match
+    const ftsQuery = `"${query.replace(/"/g, '""')}"`
 
     // Search title, subtitle, asin, isbn
     const books = await Database.bookModel.findAll({
       where: [
         {
           [Sequelize.Op.or]: [
-            Sequelize.literal(matchTitle),
-            Sequelize.literal(matchSubtitle),
+            Sequelize.literal('book.rowid IN (SELECT rowid FROM fts_books WHERE fts_books MATCH :ftsQuery)'),
             {
               asin: {
                 [Sequelize.Op.substring]: query
@@ -1074,7 +1073,7 @@ module.exports = {
         },
         ...userPermissionBookWhere.bookWhere
       ],
-      replacements: userPermissionBookWhere.replacements,
+      replacements: { ...userPermissionBookWhere.replacements, ftsQuery },
       include: [
         {
           model: Database.libraryItemModel,
@@ -1126,15 +1125,16 @@ module.exports = {
       })
     }
 
-    const matchJsonValue = textSearchQuery.matchExpression('json_each.value')
+    const textQuery = `%${query}%`
 
     // Search narrators
     const narratorMatches = []
-    const [narratorResults] = await Database.sequelize.query(`SELECT value, count(*) AS numBooks FROM books b, libraryItems li, json_each(b.narrators) WHERE json_valid(b.narrators) AND ${matchJsonValue} AND b.id = li.mediaId AND li.libraryId = :libraryId GROUP BY value LIMIT :limit OFFSET :offset;`, {
+    const [narratorResults] = await Database.sequelize.query(`SELECT value, count(*) AS numBooks FROM books b, libraryItems li, json_each(b.narrators) WHERE json_valid(b.narrators) AND json_each.value LIKE :textQuery AND b.id = li.mediaId AND li.libraryId = :libraryId GROUP BY value LIMIT :limit OFFSET :offset;`, {
       replacements: {
         libraryId: library.id,
         limit,
-        offset
+        offset,
+        textQuery
       },
       raw: true
     })
@@ -1147,11 +1147,12 @@ module.exports = {
 
     // Search tags
     const tagMatches = []
-    const [tagResults] = await Database.sequelize.query(`SELECT value, count(*) AS numItems FROM books b, libraryItems li, json_each(b.tags) WHERE json_valid(b.tags) AND ${matchJsonValue} AND b.id = li.mediaId AND li.libraryId = :libraryId GROUP BY value ORDER BY numItems DESC LIMIT :limit OFFSET :offset;`, {
+    const [tagResults] = await Database.sequelize.query(`SELECT value, count(*) AS numItems FROM books b, libraryItems li, json_each(b.tags) WHERE json_valid(b.tags) AND json_each.value LIKE :textQuery AND b.id = li.mediaId AND li.libraryId = :libraryId GROUP BY value ORDER BY numItems DESC LIMIT :limit OFFSET :offset;`, {
       replacements: {
         libraryId: library.id,
         limit,
-        offset
+        offset,
+        textQuery
       },
       raw: true
     })
@@ -1164,11 +1165,12 @@ module.exports = {
 
     // Search genres
     const genreMatches = []
-    const [genreResults] = await Database.sequelize.query(`SELECT value, count(*) AS numItems FROM books b, libraryItems li, json_each(b.genres) WHERE json_valid(b.genres) AND ${matchJsonValue} AND b.id = li.mediaId AND li.libraryId = :libraryId GROUP BY value ORDER BY numItems DESC LIMIT :limit OFFSET :offset;`, {
+    const [genreResults] = await Database.sequelize.query(`SELECT value, count(*) AS numItems FROM books b, libraryItems li, json_each(b.genres) WHERE json_valid(b.genres) AND json_each.value LIKE :textQuery AND b.id = li.mediaId AND li.libraryId = :libraryId GROUP BY value ORDER BY numItems DESC LIMIT :limit OFFSET :offset;`, {
       replacements: {
         libraryId: library.id,
         limit,
-        offset
+        offset,
+        textQuery
       },
       raw: true
     })
@@ -1180,17 +1182,16 @@ module.exports = {
     }
 
     // Search series
-    const matchName = textSearchQuery.matchExpression('name')
     const allSeries = await Database.seriesModel.findAll({
       where: {
         [Sequelize.Op.and]: [
-          Sequelize.literal(matchName),
+          Sequelize.literal('name LIKE :textQuery'),
           {
             libraryId: library.id
           }
         ]
       },
-      replacements: userPermissionBookWhere.replacements,
+      replacements: { ...userPermissionBookWhere.replacements, textQuery },
       include: {
         separate: true,
         model: Database.bookSeriesModel,
